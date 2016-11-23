@@ -5,7 +5,10 @@ from random import randint
 #from keras.layers.advanced_activations import SReLU
 #from keras.regularizers import l2, activity_l2
 #from keras.optimizers import SGD
-import math
+from deap import base
+from deap import creator
+from deap import tools
+import math, copy
 import MultiNEAT as NEAT
 import numpy as np, time
 import random
@@ -14,33 +17,309 @@ import random
 #from neat import nn
 import sys,os
 
-class Hof_util():
-    def agent_simulation(self, gridworld, parameters, agent_sub_pop=None, agent_index=None): #Put an agent in a HOF team
+class normal_net:
+    def __init__(self, num_input, num_hnodes, num_output, mean = 0, std = 1):
+        self.num_input = num_input; self.num_output = num_output; self.num_hnodes = num_hnodes; self.net_output = [] * num_output
+        #W_01 matrix contains the weigh going from input (0) to the 1st hidden layer(1)
+        self.w_01 = np.mat(np.random.normal(mean, std, num_hnodes*(num_input + 1))) #Initilize weight using Gaussian distribution
+        self.w_01 = np.mat(np.reshape(self.w_01, (num_hnodes, (num_input + 1)))) #Reshape the array to the weight matrix
+        self.w_12 = np.mat(np.random.normal(mean, std, num_output*(num_hnodes + 1)))
+        self.w_12 = np.mat(np.reshape(self.w_12, (num_output, (num_hnodes + 1)))) #Reshape the array to the weight matrix
 
-        gridworld.reset(None, agent_sub_pop, agent_index)  # Reset board
-        #dispGrid(gridworld)
-        for steps in range(parameters.total_steps):  # One training episode till goal is not reached
-            for id, agent in enumerate(gridworld.agent_list):  # get all the action choices from the agents
-                if steps == 0: agent.perceived_state = gridworld.get_state(agent)  # Update all agent's perceived state
-                if steps == 0 and parameters.split_learner: agent.split_learner_state = gridworld.get_state(agent,2)# If split learner
+    def linear_combination(self, w_matrix, layer_input): #Linear combine weights with inputs
+        return np.dot(w_matrix, layer_input) #Linear combination of weights and inputs
 
-                if id == agent_sub_pop: agent.take_action(agent_index) #Agent that is being simulated in HOF team
-                else: agent.take_action(None)  #HOF actions
+    def relu(self, layer_input):    #Relu transformation function
+        for x in range(len(layer_input)):
+            if layer_input[x] < 0:
+                layer_input[x] = 0
+        return layer_input
 
-            gridworld.move()  # Move gridworld
-            gridworld.update_poi_observations()  # Figure out the POI observations and store all credit information
+    def sigmoid(self, layer_input): #Sigmoid transform
 
-            # if agent_sub_pop==None:
-            #     dispGrid(gridworld)
-            #     raw_input('E')
+        #Just make sure the sigmoid does not explode and cause a math error
+        p = layer_input.A[0][0]
+        if p > 700:
+            ans = 0.999999
+        elif p < -700:
+            ans = 0.000001
+        else:
+            ans =  1 / (1 + math.exp(-p))
 
-            for i in range(parameters.num_agents):
-                gridworld.agent_list[i].referesh(agent_index, gridworld) #Learning part for the agent tested
-            if gridworld.check_goal_complete(): break  # If all POI's observed
+        return ans
 
-        rewards, global_reward = gridworld.get_reward()
-        #rewards -= 0.001 * steps  # Time penalty
-        return rewards, global_reward
+    def fast_sigmoid(self, layer_input): #Sigmoid transform
+        for i in layer_input: i = i / (1 + math.fabs(i))
+        return layer_input
+    #TODO TEST BENCHMARK
+
+
+    def softmax(self, layer_input): #Softmax transform
+        layer_input = np.exp(layer_input)
+        layer_input = layer_input / np.sum(layer_input)
+        return layer_input
+
+    def format_input(self, input, add_bias = True): #Formats and adds bias term to given input at the end
+        if add_bias:
+            input = np.concatenate((input, [1.0]))
+        return np.mat(input)
+
+    def feedforward(self, input): #Feedforwards the input and computes the forward pass of the network
+        #First hidden layer
+        self.input = self.format_input(input) #Format and add bias term at the end
+        self.z1 = self.linear_combination(self.w_01, self.input.transpose()) #Forward pass linear
+        self.z1 = self.format_input(self.z1, False)#Format
+        self.h1 = self.fast_sigmoid(self.z1) #Use Relu transform
+
+        #Output layer
+        self.h1 = np.vstack((self.h1,[1])) #Add bias term
+        self.z2 = self.w_12 * self.h1 #Forward pass linear
+        self.net_output = (self.fast_sigmoid((self.z2))) #Use sigmoid transform
+        return np.array(self.net_output).tolist()
+
+    def get_weights(self):
+        w1 = np.array(self.w_01).flatten().copy()
+        w2 = np.array(self.w_12).flatten().copy()
+        weights = np.concatenate((w1, w2 ))
+        return weights
+
+    def set_weights(self, weights):
+        w1 = weights[:self.num_hnodes*(self.num_input + 1)]
+        w2 = weights[self.num_hnodes*(self.num_input + 1):]
+        self.w_01 = np.mat(np.reshape(w1, (self.num_hnodes, (self.num_input + 1)))) #Reshape the array to the weight matrix
+        self.w_12 = np.mat(np.reshape(w2, (self.num_output, (self.num_hnodes + 1)))) #Reshape the array to the weight matrix
+
+class memory_net:
+    def __init__(self, num_input, num_hnodes, num_output, mean = 0, std = 1):
+        self.num_input = num_input; self.num_output = num_output; self.num_hnodes = num_hnodes; self.net_output = []
+        self.last_output = np.mat(np.zeros(num_output)).transpose()
+        self.memory_cell = np.mat(np.random.normal(mean, std, num_hnodes)).transpose() #Memory Cell
+
+        #Input gate
+        self.w_inpgate = np.mat(np.random.normal(mean, std, num_hnodes*(num_input + 1)))
+        self.w_inpgate = np.mat(np.reshape(self.w_inpgate, (num_hnodes, (num_input + 1))))
+        self.w_rec_inpgate = np.mat(np.random.normal(mean, std, num_hnodes*(num_output + 1)))
+        self.w_rec_inpgate = np.mat(np.reshape(self.w_rec_inpgate, (num_hnodes, (num_output + 1))))
+        self.w_mem_inpgate = np.mat(np.random.normal(mean, std, num_hnodes*(num_hnodes + 1)))
+        self.w_mem_inpgate = np.mat(np.reshape(self.w_mem_inpgate, (num_hnodes, (num_hnodes + 1))))
+
+        #Block Input
+        self.w_inp = np.mat(np.random.normal(mean, std, num_hnodes*(num_input + 1)))
+        self.w_inp = np.mat(np.reshape(self.w_inp, (num_hnodes, (num_input + 1))))
+        self.w_rec_inp = np.mat(np.random.normal(mean, std, num_hnodes*(num_output + 1)))
+        self.w_rec_inp = np.mat(np.reshape(self.w_rec_inp, (num_hnodes, (num_output + 1))))
+
+        #Forget gate
+        self.w_forgetgate = np.mat(np.random.normal(mean, std, num_hnodes*(num_input + 1)))
+        self.w_forgetgate = np.mat(np.reshape(self.w_forgetgate, (num_hnodes, (num_input + 1))))
+        self.w_rec_forgetgate = np.mat(np.random.normal(mean, std, num_hnodes*(num_output + 1)))
+        self.w_rec_forgetgate = np.mat(np.reshape(self.w_rec_forgetgate, (num_hnodes, (num_output + 1))))
+        self.w_mem_forgetgate = np.mat(np.random.normal(mean, std, num_hnodes*(num_hnodes + 1)))
+        self.w_mem_forgetgate = np.mat(np.reshape(self.w_mem_forgetgate, (num_hnodes, (num_hnodes + 1))))
+
+        #Output weights
+        self.w_output = np.mat(np.random.normal(mean, std, num_output*(num_hnodes + 1)))
+        self.w_output = np.mat(np.reshape(self.w_output, (num_output, (num_hnodes + 1)))) #Reshape the array to the weight matrix
+
+
+
+    def linear_combination(self, w_matrix, layer_input): #Linear combine weights with inputs
+        return np.dot(w_matrix, layer_input) #Linear combination of weights and inputs
+
+    def relu(self, layer_input):    #Relu transformation function
+        for x in range(len(layer_input)):
+            if layer_input[x] < 0:
+                layer_input[x] = 0
+        return layer_input
+
+    def sigmoid(self, layer_input): #Sigmoid transform
+
+        #Just make sure the sigmoid does not explode and cause a math error
+        p = layer_input.A[0][0]
+        if p > 700:
+            ans = 0.999999
+        elif p < -700:
+            ans = 0.000001
+        else:
+            ans =  1 / (1 + math.exp(-p))
+
+        return ans
+
+    def fast_sigmoid(self, layer_input): #Sigmoid transform
+        for i in layer_input: i[0] = i / (1 + math.fabs(i))
+        return layer_input
+
+    def gated_fast_sigmoid(self, layer_input): #Sigmoid transform between 0 and 1
+        for i in layer_input:
+            i[0] = 0.5 * (i / (1 + math.fabs(i))) + 0.5
+        return layer_input
+
+    def softmax(self, layer_input): #Softmax transform
+        layer_input = np.exp(layer_input)
+        layer_input = layer_input / np.sum(layer_input)
+        return layer_input
+
+    def format_input(self, input, add_bias = True): #Formats and adds bias term to given input at the end
+        if add_bias:
+            input = np.concatenate((input, [1.0]))
+        return np.mat(input)
+
+    def format_memory(self, memory):
+        ig = np.mat([1])
+        return np.concatenate((memory, ig))
+
+
+    def feedforward(self, input): #Feedforwards the input and computes the forward pass of the network
+        self.input = self.format_input(input).transpose()  # Format and add bias term at the end
+        last_memory = self.format_memory(self.memory_cell)
+        last_output = self.format_memory(self.last_output)
+
+        #Input gate
+        ig_1 = self.linear_combination(self.w_inpgate, self.input)
+        ig_2 = self.linear_combination(self.w_rec_inpgate, last_output)
+        ig_3 = self.linear_combination(self.w_mem_inpgate, last_memory)
+        input_gate_out = ig_1 + ig_2 + ig_3
+        input_gate_out = self.gated_fast_sigmoid(input_gate_out)
+
+        #Input processing
+        ig_1 = self.linear_combination(self.w_inp, self.input)
+        ig_2 = self.linear_combination(self.w_rec_inp, last_output)
+        block_input_out = ig_1 + ig_2
+        block_input_out = self.fast_sigmoid(block_input_out)
+
+        #Gate the Block Input and compute the final input out
+        input_out = np.multiply(input_gate_out, block_input_out)
+
+        #Forget Gate
+        ig_1 = self.linear_combination(self.w_forgetgate, self.input)
+        ig_2 = self.linear_combination(self.w_rec_forgetgate, last_output)
+        ig_3 = self.linear_combination(self.w_mem_forgetgate, last_memory)
+        forget_gate_out = ig_1 + ig_2 + ig_3
+        forget_gate_out = self.gated_fast_sigmoid(forget_gate_out)
+
+        #Memory Output
+        memory_output = np.multiply(forget_gate_out, self.memory_cell)
+
+        #Update memory Cell
+        self.memory_cell = memory_output + input_out
+
+        #Compute final output
+        new_mem = self.format_memory(self.memory_cell)
+        self.net_output = self.linear_combination(self.w_output, new_mem)
+        self.net_output = self.fast_sigmoid(self.net_output)
+        return np.array(self.net_output).tolist()
+
+    def get_weights(self):
+        #TODO NOT OPERATIONAL
+        w1 = np.array(self.w_01).flatten().copy()
+        w2 = np.array(self.w_12).flatten().copy()
+        weights = np.concatenate((w1, w2 ))
+        return weights
+
+    def set_weights(self, weights):
+        #Input gates
+        start = 0; end = self.num_hnodes*(self.num_input + 1)
+        w_inpgate = weights[start:end]
+        self.w_inpgate = np.mat(np.reshape(w_inpgate, (self.num_hnodes, (self.num_input + 1))))
+
+        start = end; end += self.num_hnodes*(self.num_output + 1)
+        w_rec_inpgate = weights[start:end]
+        self.w_rec_inpgate = np.mat(np.reshape(w_rec_inpgate, (self.num_hnodes, (self.num_output + 1))))
+
+        start = end; end += self.num_hnodes*(self.num_hnodes + 1)
+        w_mem_inpgate = weights[start:end]
+        self.w_mem_inpgate = np.mat(np.reshape(w_mem_inpgate, (self.num_hnodes, (self.num_hnodes + 1))))
+
+        # Block Inputs
+        start = end; end += self.num_hnodes*(self.num_input + 1)
+        w_inp = weights[start:end]
+        self.w_inp = np.mat(np.reshape(w_inp, (self.num_hnodes, (self.num_input + 1))))
+
+        start = end; end += self.num_hnodes*(self.num_output + 1)
+        w_rec_inp = weights[start:end]
+        self.w_rec_inp = np.mat(np.reshape(w_rec_inp, (self.num_hnodes, (self.num_output + 1))))
+
+        #Forget Gates
+        start = end; end += self.num_hnodes*(self.num_input + 1)
+        w_forgetgate = weights[start:end]
+        self.w_forgetgate = np.mat(np.reshape(w_forgetgate, (self.num_hnodes, (self.num_input + 1))))
+
+        start = end; end += self.num_hnodes*(self.num_output + 1)
+        w_rec_forgetgate = weights[start:end]
+        self.w_rec_forgetgate = np.mat(np.reshape(w_rec_forgetgate, (self.num_hnodes, (self.num_output + 1))))
+
+        start = end; end += self.num_hnodes*(self.num_hnodes + 1)
+        w_mem_forgetgate = weights[start:end]
+        self.w_mem_forgetgate = np.mat(np.reshape(w_mem_forgetgate, (self.num_hnodes, (self.num_hnodes + 1))))
+
+        #Output weights
+        start = end; end += self.num_output*(self.num_hnodes + 1)
+        w_output= weights[start:end]
+        self.w_output = np.mat(np.reshape(w_output, (self.num_output, (self.num_hnodes + 1))))
+
+        #Memory Cell (prior)
+        start = end; end += self.num_hnodes
+        memory_cell= weights[start:end]
+        self.memory_cell = np.mat(memory_cell).transpose()
+
+class Deap_evo:
+
+    def __init__(self, parameters):
+        self.num_weights = parameters.deap_param.total_num_weights; self.population_size = parameters.population_size; self.paramaters = parameters
+        self.num_elitists = int(parameters.deap_param.elite_fraction * parameters.population_size)
+
+        #Numpy based optimization module
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", np.ndarray, fitness=creator.FitnessMax)
+        self.toolbox = base.Toolbox()
+        # Attribute generator
+        self.toolbox.register("weight_init", random.uniform, -0.25, 0.25)
+        # Structure initializers
+        self.toolbox.register("individual", tools.initRepeat, creator.Individual, self.toolbox.weight_init, self.num_weights)
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        # Operators
+        #toolbox.register("evaluate", assign_fitness)  # Fitness assignment function
+        self.toolbox.register("mate", tools.cxTwoPoint)
+        self.toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.1, indpb=0.01)
+        self.toolbox.register("select", tools.selTournament, tournsize=5)
+        self.pop = self.toolbox.population(n=self.population_size)
+
+    def list_argsort(self, seq):
+        return sorted(range(len(seq)), key=seq.__getitem__)
+
+    def epoch(self, fitnesses):
+        for i, individual in enumerate(self.pop):
+            individual.fitness.values = fitnesses[i] #Assign fitness
+
+        #Elitist reserve
+        elitist_reserve = []
+        if self.num_elitists != 0:
+            elitist_index = self.list_argsort(fitnesses)[-self.num_elitists:]
+            for ind in elitist_index: elitist_reserve.append(copy.deepcopy(self.pop[ind]))
+
+        #Selection step
+        offspring = self.toolbox.select(self.pop, len(self.pop)-self.num_elitists)
+        offspring = list(map(self.toolbox.clone, offspring))
+
+        # Apply crossover and on the offspring
+        for child1, child2 in zip(offspring[::2], offspring[1::2]):
+            if random.random() < self.paramaters.crossover_prob:
+                self.toolbox.mate(child1, child2)
+
+        #Apply mutation
+        for mutant in offspring:
+            if random.random() < self.paramaters.mutation_prob:
+                self.toolbox.mutate(mutant)
+
+        #Put elitist individuals back into population
+        offspring = offspring + elitist_reserve
+
+        #Replace the old population
+        self.pop[:] = offspring
+
+    def save_population(self):
+        for index, individual in self.pop:
+            np.savetxt('ind_'+str(index), individual, delimeter = ',')
 
 class PyNeat_Config_object(object):
     allowed_connectivity = ['unconnected', 'fs_neat', 'fully_connected', 'partial']
@@ -230,97 +509,44 @@ class PyNeat_handler():
         pop.reporters.end_generation()
         sys.stdout = sys.__stdout__
 
-class Baldwin_util:
+class Evo_net():
     def __init__(self, parameters):
         self.parameters = parameters
 
-        #Figure out the prediction modules's input size
-        if parameters.state_representation == 2 or parameters.split_learner:
-            if parameters.sim_all: predictor_input = predictor_input = parameters.num_agents * 2 + parameters.num_poi * 2 + 5
-            else: predictor_input = predictor_input = parameters.num_agents * 2 + 5
+        if parameters.use_deap:
+            self.num_weights = parameters.deap_param.total_num_weights;
+            self.population_size = parameters.population_size;
+            self.paramaters = parameters
+            self.num_elitists = int(parameters.deap_param.elite_fraction * parameters.population_size)
 
-        elif parameters.state_representation == 1 and not parameters.split_learner:
-            if parameters.sim_all: predictor_input = (360 / parameters.angle_res) * 4 + 5
-            else: predictor_input = (360 / parameters.angle_res) * 2 + 5
+            # Numpy based optimization module
+            creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+            creator.create("Individual", np.ndarray, fitness=creator.FitnessMax)
+            self.toolbox = base.Toolbox()
+            # Attribute generator
+            self.toolbox.register("weight_init", random.uniform, -0.25, 0.25)
+            # Structure initializers
+            self.toolbox.register("individual", tools.initRepeat, creator.Individual, self.toolbox.weight_init,
+                                  self.num_weights)
+            self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+            # Operators
+            # toolbox.register("evaluate", assign_fitness)  # Fitness assignment function
+            self.toolbox.register("mate", tools.cxTwoPoint)
+            self.toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.1, indpb=0.01)
+            self.toolbox.register("select", tools.selTournament, tournsize=5)
+            self.pop = self.toolbox.population(n=self.population_size)
+            self.fitness_evals = [[] for x in xrange(parameters.population_size)]
+            if self.parameters.is_memoried:
+                self.net = memory_net(self.parameters.deap_param.num_input, self.parameters.deap_param.num_hnodes, self.parameters.deap_param.num_output)
+            else:
+                self.net = normal_net(self.parameters.deap_param.num_input, self.parameters.deap_param.num_hnodes,
+                                      self.parameters.deap_param.num_output)
 
-        #initiate the prediction module or the population of them
-        if parameters.share_sim_subpop: #One prediction module
-            self.simulator = init_nn(predictor_input, parameters.predictor_hnodes)
-            self.interim_model = init_nn(predictor_input, parameters.predictor_hnodes, middle_layer=True, weights=self.simulator.layers[0].get_weights())
-        else: #Population of prediction modules
-            self.simulator = []
-            for i in range(parameters.population_size + 5): self.simulator.append(init_nn(predictor_input, parameters.predictor_hnodes)) # Create simulator for each agent
-            self.interim_model = init_nn(predictor_input, parameters.predictor_hnodes, middle_layer=True, weights=self.simulator[0].layers[0].get_weights())
-        self.traj_x = []; self.traj_y = []  # trajectory for batch learning
-        self.best_sim_index = 0
 
-    #Updates the weight to the interim model
-    def update_interim_model(self, index):
-        #if index < len(self.simulator):
-        if self.parameters.share_sim_subpop: weights = self.simulator.layers[0].get_weights()
-        else: weights = self.simulator[index].layers[0].get_weights()
-        self.interim_model.layers[0].set_weights(weights)
 
-    # Get the inputs to the Evo-net (extract hidden nodes from the sim-net)
-    def get_evo_input(self, input):  # Extract the hidden layer representatiuon that will be the input to the EvoNet
-        input = self.sim_input_transform(input) #Agent only prediction scheme
-        evo_inp = self.interim_model.predict(input)
-        evo_inp = np.reshape(evo_inp, (len(evo_inp[0])))
-        return evo_inp
-
-    def sim_input_transform(self, input):  # Change state input to agent only input
-        if self.parameters.sim_all: return input
-        transformed_inp = []
-        if self.parameters.state_representation == 1 and not self.parameters.split_learner:
-            for i in range(len(input[0])):
-                if i % 4 >= 2 or i >= len(input[0]) - 5:
-                    transformed_inp.append(input[0][i])
-        elif self.parameters.state_representation == 2 or self.parameters.split_learner:
-            for i in range(self.parameters.num_poi * 2, len(input[0])):
-                transformed_inp.append(input[0][i])
-
-        transformed_inp = np.array(transformed_inp)
-        transformed_inp = np.reshape(transformed_inp, (1, len(transformed_inp)))
-        return transformed_inp
-
-    #Train simulator offline at the end
-    def offline_train(self, index):
-        if len(self.traj_x) == 0: return
-        x = np.array(self.traj_x);
-        x = np.reshape(x, (x.shape[0] * x.shape[1], x.shape[2]))
-        y = np.array(self.traj_y);
-        y = np.reshape(y, (y.shape[0] * y.shape[1], y.shape[2]))
-        if self.parameters.share_sim_subpop: self.simulator.fit(x, y, verbose=0, nb_epoch=1)
-        else: self.simulator[index].fit(x, y, verbose=0, nb_epoch=1)
-        #self.update_interim_model()
-        self.traj_x = []; self.traj_y = []
-
-    #Copy the best eprforming candidate's simulator to next generation
-    def port_best_sim(self):
-        w = self.simulator[self.best_sim_index].get_weights()
-        for i in range(len(self.simulator)):
-            self.simulator[i].set_weights(w)
-
-    # LEARNING PART
-    def learning(self, last_state, new_state, index):
-        if self.parameters.online_learning and self.parameters.baldwin and self.parameters.update_sim:
-            x = self.sim_input_transform(last_state)
-            y = self.sim_input_transform(new_state)
-            if self.parameters.share_sim_subpop: self.simulator.fit(x, y, verbose=0, nb_epoch=1)
-            else: self.simulator[index].fit(x, y, verbose=0, nb_epoch=1)
-            self.update_interim_model(index)
-        elif self.parameters.baldwin and self.parameters.update_sim:  # Just append the trajectory
-            x = self.sim_input_transform(last_state)
-            y = self.sim_input_transform(new_state)
-            self.traj_x.append(x)
-            self.traj_y.append(y)
-
-class Evo_net():
-    def __init__(self, parameters):
-        self.parameters = parameters; self.hof_net = None #Hall of Fame net
-        if parameters.baldwin: self.bald = Baldwin_util(parameters)
-        if parameters.use_neat:
+        elif parameters.use_neat:
             if parameters.use_py_neat: #Python implementation of NEAT
+
 
                 from neat import population, nn#, statistics, visualize, config
                 self.pyneat_handler = PyNeat_handler(self.parameters) #Make the pyNeat_handler object
@@ -332,6 +558,7 @@ class Evo_net():
                 self.hof_fitness_evals = [[] for x in xrange(len(self.genome_list))]
 
             else: #C++ NEAT
+
                 seed = 0 if (parameters.params.evo_hidden == 0) else 1  # Controls sees based on genome initialization
                 g = NEAT.Genome(0, parameters.evo_input_size, parameters.params.evo_hidden, 5, False, NEAT.ActivationFunction.UNSIGNED_SIGMOID,
                                 NEAT.ActivationFunction.UNSIGNED_SIGMOID, seed, parameters.params)  # Constructs genome
@@ -348,49 +575,106 @@ class Evo_net():
                 self.youngest_genome_id = 0
                 self.delta_age = self.oldest_genome_id - self.youngest_genome_id
                 self.test_net = NEAT.NeuralNetwork()
-        else:
+
+        else: #keras
             self.pop = Population(parameters.evo_input_size, parameters.keras_evonet_hnodes, 5, parameters.population_size)
             self.fitness_evals = [[] for x in xrange(parameters.population_size)] #Controls fitnesses calculations through an iteration
             self.net_list = [[] for x in xrange(parameters.population_size)] #Stores the networks for the genomes
 
+    def save_population(self):
+        if not os.path.exists('Deap_pop'):
+            os.makedirs('Deap_pop')
+        for index, individual in enumerate(self.pop):
+            np.savetxt('Deap_pop/ind_'+str(index), individual)
+
+    def list_argsort(self, seq):
+        return sorted(range(len(seq)), key=seq.__getitem__)
 
     def epoch(self): #Method to complete epoch after fitness has been assigned to the genomes
-        if self.parameters.use_py_neat: #Python based NEAT use Epoch method written outside
+        if self.parameters.use_deap:
+            for i, individual in enumerate(self.pop):
+                individual.fitness.values = self.fitness_evals[i]  # Assign fitness
+
+            # Elitist reserve
+            elitist_reserve = []
+            if self.num_elitists != 0:
+                elitist_index = self.list_argsort(self.fitness_evals)[-self.num_elitists:]
+                for ind in elitist_index: elitist_reserve.append(copy.deepcopy(self.pop[ind]))
+
+            # Selection step
+            offspring = self.toolbox.select(self.pop, len(self.pop) - self.num_elitists)
+            offspring = list(map(self.toolbox.clone, offspring))
+
+            # Apply crossover and on the offspring
+            for child1, child2 in zip(offspring[::2], offspring[1::2]):
+                if random.random() < self.paramaters.deap_param.crossover_prob:
+                    self.toolbox.mate(child1, child2)
+
+            # Apply mutation
+            for mutant in offspring:
+                if random.random() < self.paramaters.deap_param.mutation_prob:
+                    self.toolbox.mutate(mutant)
+
+            # Put elitist individuals back into population
+            offspring = offspring + elitist_reserve
+
+            # Replace the old population
+            self.pop[:] = offspring
+            return
+
+        elif self.parameters.use_py_neat: #Python based NEAT use Epoch method written outside
             self.pyneat_handler.epoch(self.pop, self.genome_list)
+            return
         else: #For C++ NEAT and Keras based Evonet, use inbuilt method
             self.pop.Epoch()  # Epoch update method inside NEAT and Keras
+            return
 
     def referesh_genome_list(self):
-        if self.parameters.use_neat:
-            if self.parameters.use_py_neat: #Python implementation of NEAT
-                self.genome_list = self.pyneat_handler.get_genomes(self.pop)
-            else:
-                self.genome_list = NEAT.GetGenomeList(self.pop) #List of genomes in this subpopulation
-            self.fitness_evals = [[] for x in xrange(len(self.genome_list))] #Controls fitnesses calculations throug an iteration
-            self.net_list = [[] for x in xrange(len(self.genome_list))]  # Stores the networks for the genomes
-        else: #Keras Evo-net
-            self.fitness_evals = [[] for x in xrange(self.parameters.population_size)]  # Controls fitnesses calculations throug an iteration
-            self.net_list = [[] for x in xrange(self.parameters.population_size)]  # Stores the networks for the genomes
+
+        if self.parameters.use_deap:
+            self.fitness_evals = [[] for x in xrange(self.parameters.population_size)]
+            return
+
+
+        # elif self.parameters.use_neat:
+        #     if self.parameters.use_py_neat: #Python implementation of NEAT
+        #         self.genome_list = self.pyneat_handler.get_genomes(self.pop)
+        #     else:
+        #         self.genome_list = NEAT.GetGenomeList(self.pop) #List of genomes in this subpopulation
+        #     self.fitness_evals = [[] for x in xrange(len(self.genome_list))] #Controls fitnesses calculations throug an iteration
+        #     self.net_list = [[] for x in xrange(len(self.genome_list))]  # Stores the networks for the genomes
+        #     return
+        # else: #Keras Evo-net
+        #     self.fitness_evals = [[] for x in xrange(self.parameters.population_size)]  # Controls fitnesses calculations throug an iteration
+        #     self.net_list = [[] for x in xrange(self.parameters.population_size)]  # Stores the networks for the genomes
+        #     return
 
     def build_net(self, index):
-        #print index, len(self.genome_list)
-        if not self.net_list[index]: #if not already built
-            if self.parameters.use_neat:
-                if self.parameters.use_py_neat: #Python NEAT
-                    self.net_list[index] = nn.create_feed_forward_phenotype(self.genome_list[index])
-                else: #C++ NEAT
-                    self.net_list[index] = NEAT.NeuralNetwork();
-                    self.genome_list[index].BuildPhenotype(self.net_list[index]);
-                    self.net_list[index].Flush()  # Build net from genome
-                #self.genome_list[index].Save('test')
+        if self.parameters.use_deap:
+            self.net.set_weights(self.pop[index])
+            return
 
 
-            else:
-                self.net_list[index] = self.pop.net_pop[int(self.pop.pop_handle[index][0])]
-        #self.net_list[index].Save('a')
+            # if self.parameters.use_neat:
+            #     if self.parameters.use_py_neat: #Python NEAT
+            #         self.net_list[index] = nn.create_feed_forward_phenotype(self.genome_list[index])
+            #     else: #C++ NEAT
+            #         self.net_list[index] = NEAT.NeuralNetwork();
+            #         self.genome_list[index].BuildPhenotype(self.net_list[index]);
+            #         self.net_list[index].Flush()  # Build net from genome
+            #     #self.genome_list[index].Save('test')
+            # else:
+            #     self.net_list[index] = self.pop.net_pop[int(self.pop.pop_handle[index][0])]
+
 
     # Get action choice from Evo-net
-    def run_evo_net(self, net_id, state, hof_subpop = None):
+    def run_evo_net(self, state):
+        if self.parameters.use_deap:
+            output = self.net.feedforward(state)
+            return np.argmax(output)
+
+
+
         scores = [] #Probability output for five action choices
         if self.parameters.use_neat:
             if self.parameters.use_py_neat:  # Python NEAT
@@ -418,7 +702,20 @@ class Evo_net():
         return action
 
     def update_fitness(self): #Update the fitnesses of the genome and also encode the best one for the generation
-        if self.parameters.use_neat:
+
+        if self.parameters.use_deap:
+            best = 0;
+            for i in range(self.parameters.population_size):
+                if len(self.fitness_evals[i]) != 0:  # if fitness evals is not empty (wasnt evaluated)
+                    if self.parameters.leniency: avg_fitness = max(self.fitness_evals[i]) #Use lenient learner
+                    else: avg_fitness = sum(self.fitness_evals[i])/len(self.fitness_evals[i])
+                    if avg_fitness > best:
+                        best = avg_fitness
+                    self.pop[i].fitness.values = avg_fitness,
+
+
+
+        elif self.parameters.use_neat:
             if self.parameters.use_py_neat: #Python NEAT
                 best = 0; best_sim_index = 0
                 for i, g in enumerate(self.genome_list):
@@ -463,9 +760,7 @@ class Evo_net():
                     self.pop.pop_handle[i][1] = 1-avg_fitness #Update fitness
         #print best
 
-        if self.parameters.baldwin: self.bald.best_sim_index = best_sim_index #Assign the new top simulator #TODO Generalize this to best performing index and ignore if not evaluated
-
-class Agent_scout:
+class Agent:
     def __init__(self, grid, parameters, team_role_index):
         self.parameters = parameters
         self.team_role_index = team_role_index
@@ -473,7 +768,7 @@ class Agent_scout:
         self.position = self.spawn_position[:]
 
 
-        self.action = 0
+        self.action = []
         self.evo_net = Evo_net(parameters)
         self.perceived_state = None #State of the gridworld as perceived by the agent
         self.split_learner_state = None #Useful for split learner
@@ -597,247 +892,10 @@ class Agent_scout:
         self.action = action
 
 
-    def take_action(self, net_id):
+    def take_action(self):
         #Modify state input to required input format
-        if self.parameters.baldwin:
-            if self.parameters.split_learner: padded_state = self.pad_state(self.split_learner_state)
-            else: padded_state = self.pad_state(self.perceived_state)
-            evo_input = self.evo_net.bald.get_evo_input(padded_state)  # Hidden nodes from simulator
-            if self.parameters.augmented_input:
-                #if self.parameters.split_learner: evo_input = np.append(evo_input, self.split_learner_state.flatten())  # Augment input with state info
-                evo_input = np.append(evo_input, self.perceived_state.flatten())  # Augment input with state info
-        else: #Darwin
-            if self.parameters.split_learner:
-                evo_input = np.append(self.perceived_state, self.split_learner_state)
-                #evo_input = np.reshape(self.perceived_state, (self.perceived_state.shape[1]))
-            else:
-                evo_input = np.reshape(self.perceived_state, (self.perceived_state.shape[1]))  # State input only (Strictly Darwinian approach)
-        self.action = self.evo_net.run_evo_net(net_id, evo_input) #Take action
-
-    def referesh(self, net_id, grid):
-        if not self.parameters.baldwin: #In case of Darwin
-            self.perceived_state = grid.get_state(self, is_Scout=True)  # Update all agent's perceived state
-            return
-        else: #Baldwin
-            if self.parameters.split_learner: #If split uelearning
-                x = self.split_learner_state;
-                self.perceived_state = grid.get_state(self)  # Update all agent's perceived state
-                self.split_learner_state = grid.get_state(self, 2)  # Update all agent's perceived state
-                y = self.split_learner_state;
-            else: #If no split learning
-                x = self.perceived_state;
-                self.perceived_state = grid.get_state(self)  # Update all agent's perceived state
-                y = self.perceived_state;
-
-            if self.parameters.update_sim and net_id != None: #Learning part
-                x = self.pad_state(x);
-                y = self.pad_state(y)  # Pad state
-                x[0][len(x[0]) - 5 + self.action] = 1  # Encode action taken
-                self.evo_net.bald.learning(x, y, net_id)
-
-    def ready_for_simulation(self, net_id):
-        if self.parameters.online_learning and self.parameters.baldwin:  # Update interim model belonging to the teams[i] indexed individual in the ith sub-population
-            self.evo_net.bald.update_interim_model(net_id)
-
-    def pad_state(self, state):
-        state = np.append(state, 0)  # Add action to the state
-        state = np.append(state, 0)  # Add action to the state
-        state = np.append(state, 0)  # Add action to the state
-        state = np.append(state, 0)  # Add action to the state
-        state = np.append(state, 0)  # Add action to the state
-        state = np.reshape(state, (1, len(state)))
-        return state
-
-class Agent_service_bot:
-    def __init__(self, grid, parameters, team_role_index):
-        self.parameters = parameters
-        self.team_role_index = team_role_index
-        self.spawn_position = self.init_agent(grid)
-        self.position = self.spawn_position[:]
-
-
-        self.action = 0
-        self.evo_net = Evo_net(parameters)
-        self.perceived_state = None #State of the gridworld as perceived by the agent
-        self.split_learner_state = None #Useful for split learner
-        self.fuel = 0
-        self.service_cost = 0
-
-
-
-
-    def init_agent(self, grid, is_new_epoch=True):
-        if not is_new_epoch: #If not a new epoch and intra epoch (random already initialized)
-            x = self.spawn_position[0]; y = self.spawn_position[1]
-            grid.state[x][y] = 4
-            return [x,y]
-
-        start = grid.observe;  end = grid.state.shape[0] - grid.observe - 1
-        rad = int(grid.dim_row / math.sqrt(3) / 3)
-        center = int((start + end) / 2)
-
-        if self.parameters.aamas_domain == 1:  # AAMAS test domain
-            if self.team_role_index == 0:
-                x = 9; y = 8
-            elif self.team_role_index == 1:
-                x = 9; y = 11
-            elif self.team_role_index == 2:
-                x = 10; y = 8
-            elif self.team_role_index == 3:
-                x = 10; y = 11
-            elif self.team_role_index == 4:
-                x = 8; y = 9
-            elif self.team_role_index == 5:
-                x = 11; y = 9
-            elif self.team_role_index == 6:
-                x = 8; y = 10
-            elif self.team_role_index == 7:
-                x = 11; y = 10
-
-            grid.state[x][y] = 4
-            return [x, y]
-
-        if self.parameters.domain_setup != 0:  # Known domain testing
-            if self.parameters.domain_setup == 1:
-                x = 2;
-                y = 3 + 2 * self.team_role_index
-
-            elif self.parameters.domain_setup == 2:
-                if self.team_role_index == 0:
-                    x = 12; y = 1
-                elif self.team_role_index == 1:
-                    x = 14; y = 1
-                elif self.team_role_index == 2:
-                    x = 12; y = 14
-                elif self.team_role_index == 3:
-                    x = 14; y = 14
-
-            elif self.parameters.domain_setup == 3:
-                if self.team_role_index == 0:
-                    x = 1; y = 7
-                elif self.team_role_index == 1:
-                    x = 9; y = 7
-
-
-            grid.state[x][y] = 4
-            return [x, y]
-
-
-
-
-
-
-        if grid.agent_rand:
-            while True:
-                x = randint(center - rad, center + rad)
-                y = randint(center - rad, center + rad)
-                if grid.state[x][y] != 1: #position not already occupied
-                    break
-        else:  # Not random
-            trial = 0
-            while True:
-                while True:
-                    x = center - rad + (trial % (rad*2))
-                    if x <= center + rad: break #If within limits
-                while True:
-                    y = center - rad + (trial / (rad*2))
-                    if y <= center + rad: break #If within limits
-
-                if grid.state[x][y] != 1 and grid.state[x][y] != 4: #position not already occupied
-                    break
-                trial+=1
-
-        grid.state[x][y] = 4  # Agent Code
-        return [x, y]
-
-    def reset(self, grid, is_new_epoch=False):
-        self.spawn_position = self.init_agent(grid, is_new_epoch)
-        self.position = self.spawn_position[:]
-        self.fuel = 0
-        self.service_cost = 0
-
-    def take_action(self, net_id):
-        #Modify state input to required input format
-        if self.parameters.baldwin:
-            if self.parameters.split_learner: padded_state = self.pad_state(self.split_learner_state)
-            else: padded_state = self.pad_state(self.perceived_state)
-            evo_input = self.evo_net.bald.get_evo_input(padded_state)  # Hidden nodes from simulator
-            if self.parameters.augmented_input:
-                #if self.parameters.split_learner: evo_input = np.append(evo_input, self.split_learner_state.flatten())  # Augment input with state info
-                evo_input = np.append(evo_input, self.perceived_state.flatten())  # Augment input with state info
-        else: #Darwin
-            if self.parameters.split_learner:
-                evo_input = np.append(self.perceived_state, self.split_learner_state)
-                #evo_input = np.reshape(self.perceived_state, (self.perceived_state.shape[1]))
-            else:
-                evo_input = np.reshape(self.perceived_state, (self.perceived_state.shape[1]))  # State input only (Strictly Darwinian approach)
-        self.action = self.evo_net.run_evo_net(net_id, evo_input) #Take action
-
-    def take_action_test(self):
-        # Modify state input to required input format
-        if self.parameters.baldwin:
-            if self.parameters.split_learner:
-                padded_state = self.pad_state(self.split_learner_state)
-            else:
-                padded_state = self.pad_state(self.perceived_state)
-            evo_input = self.evo_net.bald.get_evo_input(padded_state)  # Hidden nodes from simulator
-            if self.parameters.augmented_input:
-                # if self.parameters.split_learner: evo_input = np.append(evo_input, self.split_learner_state.flatten())  # Augment input with state info
-                evo_input = np.append(evo_input, self.perceived_state.flatten())  # Augment input with state info
-        else:  # Darwin
-            if self.parameters.split_learner:
-                evo_input = np.append(self.perceived_state, self.split_learner_state)
-                # evo_input = np.reshape(self.perceived_state, (self.perceived_state.shape[1]))
-            else:
-                evo_input = np.reshape(self.perceived_state, (
-                self.perceived_state.shape[1]))  # State input only (Strictly Darwinian approach)
-
-        # Run test evonet and return action
-        scores = []  # Probability output for five action choices
-        if self.parameters.use_neat:
-            if self.parameters.use_py_neat:  # Python NEAT
-                scores = self.evo_net.test_net.serial_activate(evo_input)
-
-            else:  # C++ NEAT
-                self.evo_net.test_net.Flush()
-                self.evo_net.test_net.Input(
-                    evo_input)  # can input numpy arrays, too for some reason only np.float64 is supported
-                self.evo_net.test_net.Activate()
-                for i in range(5):
-                    if not math.isnan(1 * self.evo_net.test_net.Output()[i]):
-                        scores.append(1 * self.evo_net.test_net.Output()[i])
-                    else:
-                        scores.append(0)
-        else:  # Use keras Evo-net
-            state = np.reshape(evo_input, (1, len(evo_input)))
-            scores = self.evo_net.test_net.predict(state)[0]
-        #if self.parameters.wheel_action and sum(scores) != 0: action = roulette_wheel(scores)
-        if sum(scores) != 0 and len(set(scores)) != 1: action = np.argmax(scores)
-        else: action = randint(0,4)
-        #action = np.argmax(scores)
-
-        self.action = action
-
-    def referesh(self, net_id, grid):
-        if not self.parameters.baldwin: #In case of Darwin
-            self.perceived_state = grid.get_state(self, is_Scout=False)  # Update all agent's perceived state
-            return
-        else: #Baldwin
-            if self.parameters.split_learner: #If split learning
-                x = self.split_learner_state;
-                self.perceived_state = grid.get_state(self)  # Update all agent's perceived state
-                self.split_learner_state = grid.get_state(self, 2)  # Update all agent's perceived state
-                y = self.split_learner_state;
-            else: #If no split learning
-                x = self.perceived_state;
-                self.perceived_state = grid.get_state(self)  # Update all agent's perceived state
-                y = self.perceived_state;
-
-            if self.parameters.update_sim and net_id != None: #Learning part
-                x = self.pad_state(x);
-                y = self.pad_state(y)  # Pad state
-                x[0][len(x[0]) - 5 + self.action] = 1  # Encode action taken
-                self.evo_net.bald.learning(x, y, net_id)
+        evo_input = np.reshape(self.perceived_state, (self.perceived_state.shape[1]))  # State input only (Strictly Darwinian approach)
+        self.action = self.evo_net.run_evo_net(evo_input) #Take action
 
     def ready_for_simulation(self, net_id):
         if self.parameters.online_learning and self.parameters.baldwin:  # Update interim model belonging to the teams[i] indexed individual in the ith sub-population
@@ -858,18 +916,10 @@ class POI:
         self.team_role_index = team_role_index
         self.spawn_position = self.init_poi(grid)
         self.position = self.spawn_position[:]
-        self.is_observed = False #Check if goal is complete
-        self.is_scouted = False #Found by scout
         self.spawn_position = self.position[:]
         self.previous_actions = [0,0]
-
-
-        #self.observation_history = []  # Track the identity of agents within the coupling requirements at all applicable time steps
-        #self.scout_history = [] #Track which scout scouted it
-
-        self.activation_log = []
-        self.success_completion_log = []
-        #self.activation_time = -10
+        self.observation_log = []
+        self.is_observed = False
 
     def take_action(self):
         if self.parameters.periodic_poi:
@@ -992,18 +1042,13 @@ class POI:
         self.spawn_position = self.init_poi(grid, is_new_epoch)
         self.position = self.spawn_position[:]
         self.is_observed = False
-        self.is_scouted = False #Found by scout
-        self.success_completion_log = []
-        self.activation_log = []
-        #self.observation_history = []
-
-        #self.scout_history = [] #Track which scout scouted it
+        self.observation_log = []
 
 class Gridworld:
     def __init__(self, parameters):
         self.parameters = parameters
         self.observe = 1; self.dim_row = parameters.grid_row; self.dim_col = parameters.grid_col; self.poi_rand = parameters.poi_random; self.agent_rand = parameters.agent_random
-        self.num_agents_scout = parameters.num_agents_scout; self.num_agents_service_bot = parameters.num_agents_service_bot; self.num_poi = parameters.num_poi; self.angle_res = parameters.angle_res #Angle resolution
+        self.num_agents = parameters.num_agents;  self.num_poi = parameters.num_poi; self.angle_res = parameters.angle_res #Angle resolution
         self.coupling = parameters.coupling #coupling requirement
         self.obs_dist = parameters.obs_dist #Observation radius requirements
 
@@ -1016,10 +1061,8 @@ class Gridworld:
         for i in range(self.num_poi):
             self.poi_list.append(POI(self, parameters, i))
 
-        self.agent_list_scout = []
-        for i in range(self.num_agents_scout): self.agent_list_scout.append(Agent_scout(self, parameters, i))
-        self.agent_list_service_bot = []
-        for i in range(self.num_agents_service_bot): self.agent_list_service_bot.append(Agent_service_bot(self, parameters, i))
+        self.agent_list = []
+        for i in range(self.num_agents): self.agent_list.append(Agent(self, parameters, i))
 
     def init_wall(self):
         for i in range(self.observe):
@@ -1035,49 +1078,29 @@ class Gridworld:
         self.init_wall()
         self.epoch_best_team = None
         for poi in self.poi_list: poi.reset(self, is_new_epoch=True)
-        for agent_id, agent in enumerate(self.agent_list_scout):
-            agent.reset(self, is_new_epoch=True)
-        for agent_id, agent in enumerate(self.agent_list_service_bot):
+        for agent_id, agent in enumerate(self.agent_list):
             agent.reset(self, is_new_epoch=True)
 
-    def reset(self, teams, agent_sub_pop = None, agent_index = None):
+
+    def reset(self, genome_index):
         self.state = np.zeros((self.dim_row + self.observe*2, self.dim_col + self.observe*2)) #EMPTY SPACE = 0, AGENT = 1, #POI = 2, WALL = 3
         self.init_wall()
+
         for poi in self.poi_list: poi.reset(self)
-
-        for agent_id, agent in enumerate(self.agent_list_scout):
+        for agent_id, agent in enumerate(self.agent_list):
             agent.reset(self)
-            if self.parameters.use_hall_of_fame:
-                if agent_id != agent_sub_pop: continue #if not the agent being tested iin hof team, continue
-                net_index = agent_index
-            else: #Not Hall of Fame
-                net_index = teams[agent_id]
+            agent.evo_net.build_net(genome_index)
 
-            agent.ready_for_simulation(net_index)  # Get all agents ready by updating interim model if necesary
-            if not self.parameters.online_learning: #Offline learning
-                agent.evo_net.bald.offline_train(net_index)
-
-        for agent_id, agent in enumerate(self.agent_list_service_bot):
-            agent.reset(self)
-            if self.parameters.use_hall_of_fame:
-                if agent_id != agent_sub_pop: continue #if not the agent being tested iin hof team, continue
-                net_index = agent_index
-            else: #Not Hall of Fame
-                net_index = teams[agent_id]
-
-            agent.ready_for_simulation(net_index)  # Get all agents ready by updating interim model if necesary
-            if not self.parameters.online_learning: #Offline learning
-                agent.evo_net.bald.offline_train(net_index)
 
     def move(self):
-        for agent in self.agent_list_scout: #Move and agent
+        for agent in self.agent_list: #Move and agent
             action = agent.action
+            #print action
             next_pos = np.copy(agent.position)
-            if action == 1: next_pos[1] += 2  # Right
-            elif action == 2: next_pos[0] += 2  # Down
-            elif action == 3: next_pos[1] -= 2  # Left
-            elif action == 4: next_pos[0] -= 2  # Up
-            if action != 0: agent.fuel -= 0.1/(1.0 * self.parameters.total_steps)
+            if action == 1: next_pos[1] += 1  # Right
+            elif action == 2: next_pos[0] += 1  # Down
+            elif action == 3: next_pos[1] -= 1  # Left
+            elif action == 4: next_pos[0] -= 1  # Up
 
             # Computer reward and check illegal moves
             x = next_pos[0]; y = next_pos[1]
@@ -1095,52 +1118,29 @@ class Gridworld:
             self.state[next_pos[0]][next_pos[1]] = 1 #Encode newly occupied position in the state template
             agent.position[0] = next_pos[0]; agent.position[1] = next_pos[1] #Update new positions for the agent object
 
-        for agent in self.agent_list_service_bot: #Move and agent
-            action = agent.action
-            next_pos = np.copy(agent.position)
-            if action == 1: next_pos[1] += 1  # Right
-            elif action == 2: next_pos[0] += 1  # Down
-            elif action == 3: next_pos[1] -= 1  # Left
-            elif action == 4: next_pos[0] -= 1  # Up
-            if action != 0: agent.fuel -= 0.2/ (1.0 * self.parameters.total_steps)
 
-            # Computer reward and check illegal moves
-            x = next_pos[0]; y = next_pos[1]
-            if self.state[x][y] == 3: next_pos = np.copy(agent.position) #Reset if hit wall
-            if self.state[x][y] == 4 and action != 0: next_pos = np.copy(agent.position) #Reset if other service_bot Agent and action != 0
 
-            # Update gridworld and agent position
-            self.state[agent.position[0]][agent.position[1]] = 0 #Encode newly freed position in the state template
-            self.state[next_pos[0]][next_pos[1]] = 4 #Encode newly occupied position in the state template
-            agent.position[0] = next_pos[0]; agent.position[1] = next_pos[1] #Update new positions for the agent object
-
-    def get_state(self, agent, is_Scout, state_representation = None):  # Returns a flattened array around the agent position
+    def get_state(self, agent, state_representation = None):  # Returns a flattened array around the agent position
         if state_representation == None: state_representation = self.parameters.state_representation #If no override use choice in parameters
         if state_representation == 1:  # Angle brackets
-            state = np.zeros(((360 / self.angle_res), 6))
+            state = np.zeros(((360 / self.angle_res), 2))
             if self.parameters.sensor_avg:  # Average distance
                 dist_poi_list = [[] for x in xrange(360 / self.angle_res)]
-                dist_agent_list_scout = [[] for x in xrange(360 / self.angle_res)]
-                dist_agent_list_service_bot = [[] for x in xrange(360 / self.angle_res)]
+                dist_agent_list = [[] for x in xrange(360 / self.angle_res)]
+
 
             for poi in self.poi_list:
                 if not poi.is_observed:  # For all POI's that are still active
-                    if poi.is_scouted or is_Scout: #Scout sees all but service_bot only sees what has been found
-                        x1 = poi.position[0] - agent.position[0];
-                        x2 = -1
-                        y1 = poi.position[1] - agent.position[1];
-                        y2 = 0
-                        angle, dist = self.get_angle_dist(x1, y1, x2, y2)
-                        bracket = int(angle / self.angle_res);
-                        state[bracket][0] += 1.0 / self.num_poi  # Add POIs
-                        if self.parameters.sensor_avg:
-                            dist_poi_list[bracket].append(dist / (2.0 * self.dim_col))
-                        else:  # Min distance
-                            if state[bracket][1] > dist / (2.0 * self.dim_col) or state[bracket][
-                                1] == 0:  # Update min distance from POI
-                                state[bracket][1] = dist / (2.0 * self.dim_col)
+                    x1 = poi.position[0] - agent.position[0];
+                    x2 = -1
+                    y1 = poi.position[1] - agent.position[1];
+                    y2 = 0
+                    angle, dist = self.get_angle_dist(x1, y1, x2, y2)
+                    bracket = int(angle / self.angle_res)
+                    dist_poi_list[bracket].append(dist / (2.0 * self.dim_col))
 
-            for other_agent in self.agent_list_scout:
+
+            for other_agent in self.agent_list:
                 if other_agent != agent:  # FOR ALL AGENTS MINUS MYSELF
                     x1 = other_agent.position[0] - agent.position[0];
                     x2 = -1
@@ -1148,46 +1148,25 @@ class Gridworld:
                     y2 = 0
                     angle, dist = self.get_angle_dist(x1, y1, x2, y2)
                     bracket = int(angle / self.angle_res)
-                    state[bracket][2] += 1.0 / (self.num_agents_service_bot + self.num_agents_scout - 1)  # Add agent
-                    if self.parameters.sensor_avg:
-                        dist_agent_list_scout[bracket].append(dist / (2.0 * self.dim_col))
-                    else:  # Min distance
-                        if state[bracket][3] > dist / (2.0 * self.dim_col) or state[bracket][
-                            3] == 0:  # Update min distance from other agent
-                            state[bracket][3] = dist / (2.0 * self.dim_col)
+                    dist_agent_list[bracket].append(dist / (2.0 * self.dim_col))
 
-            for other_agent in self.agent_list_service_bot:
-                if other_agent != agent:  # FOR ALL AGENTS MINUS MYSELF
-                    x1 = other_agent.position[0] - agent.position[0];
-                    x2 = -1
-                    y1 = other_agent.position[1] - agent.position[1];
-                    y2 = 0
-                    angle, dist = self.get_angle_dist(x1, y1, x2, y2)
-                    bracket = int(angle / self.angle_res)
-                    state[bracket][4] += 1.0 / (self.num_agents_service_bot + self.num_agents_scout - 1)  # Add agent
-                    if self.parameters.sensor_avg:
-                        dist_agent_list_service_bot[bracket].append(dist / (2.0 * self.dim_col))
-                    else:  # Min distance
-                        if state[bracket][5] > dist / (2.0 * self.dim_col) or state[bracket][
-                            3] == 0:  # Update min distance from other agent
-                            state[bracket][5] = dist / (2.0 * self.dim_col)
+
 
             if self.parameters.sensor_avg:
-                for bracket in range(len(dist_agent_list_scout)):
-                    try: state[bracket][1] = sum(dist_poi_list[bracket]) / len(dist_poi_list[bracket])  # Encode average POI distance
+                for bracket in range(len(dist_agent_list)):
+                    try: state[bracket][0] = sum(dist_poi_list[bracket]) / len(dist_poi_list[bracket])  # Encode average POI distance
                     except: None
-                    try: state[bracket][3] = sum(dist_agent_list_scout[bracket]) / len(dist_agent_list_scout[bracket])  # Encode average agent distance
-                    except: None
-                    try: state[bracket][5] = sum(dist_agent_list_service_bot[bracket]) / len(dist_agent_list_service_bot[bracket])  # Encode average agent distance
+                    try: state[bracket][1] = sum(dist_agent_list[bracket]) / len(dist_agent_list[bracket])  # Encode average agent distance
                     except: None
 
-            if self.parameters.sensor_noise != 0:
-                for bracket in range(len(dist_agent_list_scout)):
-                    for i in range(6):
-                        state[bracket][i] += (random.random() - 0.5) * 2 * self.parameters.sensor_noise * state[bracket][i]
+
+            # if self.parameters.sensor_noise != 0:
+            #     for bracket in range(len(dist_agent_list)):
+            #         for i in range(6):
+            #             state[bracket][i] += (random.random() - 0.5) * 2 * self.parameters.sensor_noise * state[bracket][i]
 
 
-            state = np.reshape(state, (1, 360 / self.angle_res * 6))  # Flatten array
+            state = np.reshape(state, (1, 360 / self.angle_res * 2))  # Flatten array
 
         if state_representation == 2:  # List agent/POI representation fully obserbavle
             state = np.zeros(self.num_agents * 2 + self.num_poi * 2)
@@ -1212,19 +1191,7 @@ class Gridworld:
                     state[2 * self.num_poi + 2 * id + 1] = dist / (2.0 * self.dim_col)
             state = np.reshape(state, (1, self.num_agents * 2 + self.num_poi * 2))  # Flatten array
 
-        if state_representation == 3:  # Binary state representation
-            x_beg = self.agent_pos[agent_id][0] - self.observe
-            y_beg = self.agent_pos[agent_id][1] - self.observe
-            x_end = self.agent_pos[agent_id][0] + self.observe + 1
-            y_end = self.agent_pos[agent_id][1] + self.observe + 1
-            state = np.copy(self.state)
-            state = state[x_beg:x_end, :]
-            state = state[:, y_beg:y_end]
-            state = np.reshape(state, (1, pow(self.observe * 2 + 1, 2)))  # Flatten array
-            k = np.reshape(np.zeros(len(state[0]) * 4), (len(state[0]), 4))  # 4-bit encoding
-            for i in range(len(state[0])):
-                k[i][int(state[0][i])] = 1
-            k = np.reshape(k, (1, len(state[0]) * 4))  # Flatten array
+
         return state
 
     def get_angle_dist(self, x1, y1, x2, y2):  # Computes angles and distance between two agents relative to (1,0) vector (x-axis)
@@ -1237,84 +1204,23 @@ class Gridworld:
         dist = math.sqrt(dist)
         return angle, dist
 
-    def old_update_poi_observations(self):
-        # Check for credit assignment
-        for poi in self.poi_list:  # POI COUPLED
-            if self.parameters.is_time_offset: poi.activation_time -= 1 #Decrease POI's activation time
-            #Scouts
-            soft_stat = []
-            for agent_id, agent in enumerate(self.agent_list_scout): #Find all scouts within range
-                if abs(poi.position[0] - agent.position[0]) <= self.obs_dist*2 and abs(poi.position[1] - agent.position[1]) <= self.obs_dist*2:  # and self.goal_complete[poi_id] == False:
-                    soft_stat.append(agent_id)
-            if len(soft_stat) >= self.coupling:  # If coupling requirement is met
-                if self.parameters.is_time_offset: poi.activation_time = self.parameters.time_offset #Reset activation time
-                poi.is_scouted = True
-                poi.scout_history.append(soft_stat)  # Store the identity of agents aiding in meeting that tight coupling requirement
-
-            #Service_bots
-            soft_stat = []
-            for agent_id, agent in enumerate(self.agent_list_service_bot):  # Find all service bots within range
-                if abs(poi.position[0] - agent.position[0]) <= self.obs_dist and abs(poi.position[1] - agent.position[
-                    1]) <= self.obs_dist:
-                    soft_stat.append(agent_id)
-                    agent.service_cost -= 0.1 / (1.0 * self.parameters.total_steps)
-            if len(soft_stat) >= self.coupling:  # If coupling requirement is met
-                ig_scheme = True #implements the different reward schemes #1: Order not relevant and is_scouted not required
-                                                                          #2: Order not relevant and is_scouted required
-                                                                          #3: Order relevant and is_scouted required
-                if self.parameters.reward_scheme == 3:
-                    if not poi.is_scouted: ig_scheme = False
-                if self.parameters.is_time_offset:
-                    if self.parameters.is_hard_time_offset:
-                        if poi.activation_time != 0: ig_scheme = False
-                    else:
-                        if poi.activation_time <= 0: ig_scheme = False #Implement time coupling scheme
-
-                if ig_scheme:
-                    poi.is_observed = True
-                    poi.observation_history.append(soft_stat)  # Store the identity of agents aiding in meeting that tight coupling requirement
-
     def update_poi_observations(self):
         # Check for credit assignment
         for poi in self.poi_list:  # POI COUPLED
 
-
-            #Scouts
+            #Agents
             soft_stat = []
-            for agent_id, agent in enumerate(self.agent_list_scout): #Find all scouts within range
+            for agent_id, agent in enumerate(self.agent_list): #Find all scouts within range
                 if abs(poi.position[0] - agent.position[0]) <= self.obs_dist*2 and abs(poi.position[1] - agent.position[1]) <= self.obs_dist*2:  # and self.goal_complete[poi_id] == False:
                     soft_stat.append(agent_id)
             if len(soft_stat) >= self.coupling:  # If coupling requirement is met
-                poi.activation_log.append([agent_id, self.parameters.time_offset])
-                poi.is_scouted = True
-                #poi.scout_history.append(soft_stat)  # Store the identity of agents aiding in meeting that tight coupling requirement
+                for ag_id in soft_stat: poi.observation_log.append(ag_id)
+                poi.is_observed = True
 
-            #Service_bots
-            soft_stat = []
-            for agent_id, agent in enumerate(self.agent_list_service_bot):  # Find all service bots within range
-                if abs(poi.position[0] - agent.position[0]) <= self.obs_dist and abs(poi.position[1] - agent.position[
-                    1]) <= self.obs_dist:
-                    soft_stat.append(agent_id)
-                    agent.service_cost -= 0.1 / (1.0 * self.parameters.total_steps)
-            if len(soft_stat) >= self.coupling:  # If coupling requirement is met
-                #implements the different reward schemes #1: Order not relevant and is_scouted not required
-                                                                          #2: Order not relevant and is_scouted required
-                                                                          #3: Order relevant and is_scouted required
-                if self.parameters.reward_scheme == 3 and poi.is_scouted:
-                        for entry_id, entry in enumerate(poi.activation_log):
-                            if self.parameters.is_hard_time_offset:
-                                if entry[1] == 0:
-                                    for ag_id in soft_stat: poi.success_completion_log.append([entry[0], ag_id]) #Put scout responsible and service agent  in the success log
-                                    poi.is_observed = True
-                            else:
-                                if entry[1] >= 0:
-                                    for ag_id in soft_stat: poi.success_completion_log.append([entry[0], ag_id]) #Put scout responsible and service agent  in the success log
-                                    poi.is_observed = True
 
-            #Update poi_activation logs
-            for entry_id, entry in enumerate(poi.activation_log):
-                entry[1] -= 1
-                if entry[1] < 0: poi.activation_log.pop(entry_id)
+    def save_pop(self):
+        if self.parameters.use_deap:
+            self.agent_list[0].evo_net.save_population()
 
     def check_goal_complete(self):
         is_complete = True
@@ -1322,64 +1228,32 @@ class Gridworld:
             is_complete *= poi.is_observed
         return is_complete
 
-    def get_reward(self, teams):
-        global_reward = 0 #Global reward obtained
-        for poi in self.poi_list:
-            if self.parameters.reward_scheme == 2:
-                global_reward += 1.0 * poi.is_observed * poi.is_scouted
-            else:
-                global_reward += 1.0 * poi.is_observed
-        global_reward /= self.parameters.num_poi #Scale between 0 and 1
+    def get_reward(self):
+        global_reward = 0.0 #Global reward obtained
+        for poi in self.poi_list: global_reward += poi.is_observed
+        global_reward /= self.parameters.num_poi
+        rewards = np.zeros(self.parameters.num_agents)
 
-        rewards = np.zeros(self.parameters.num_agents_scout + self.parameters.num_agents_service_bot) #Rewards decomposed to the team
-        if self.parameters.is_fuel:
-            for i in range((self.parameters.num_agents_scout + self.parameters.num_agents_service_bot)):
-                if i < self.parameters.num_agents_scout:
-                    rewards[i] += self.agent_list_scout[i].fuel + 1.0 #Make it positive
-                    global_reward += self.agent_list_scout[i].fuel/self.parameters.num_agents_scout
-                else:
-                    index = i - self.parameters.num_agents_scout
-                    rewards[i] += self.agent_list_service_bot[index].fuel + 1.0 #Make it positive
-                    global_reward += self.agent_list_service_bot[index].fuel/self.parameters.num_agents_service_bot
-
-        if self.parameters.is_service_cost:
-            for i in range(self.parameters.num_agents_service_bot):
-                rewards[i] += self.agent_list_service_bot[i].service_cost
-                global_reward += self.agent_list_service_bot[i].service_cost/self.parameters.num_agents_service_bot
 
         if self.parameters.D_reward: #Difference reward scheme
             for poi in self.poi_list:
                 if poi.is_observed: #If POI observed
                     no_reward = False
 
-                    # Check if over-observed (service_bot)
-                    all_servicers = [a[1] for a in poi.success_completion_log]
-                    unique_servicers = set(all_servicers)
-                    if len(unique_servicers) > self.parameters.coupling:  # Only if it's observed by exactly the numbers needed
-                        no_reward = True;
-
-
-                    # Service_bots rewards
-                    if not no_reward:
-                        for agent_id in unique_servicers:
-                            rewards[self.num_agents_scout+ agent_id] += 1.0 / self.parameters.num_poi  # Reward the first group of agents to get there
-
-
                     # Check if over-observed (Scout)
                     no_reward = False
-                    all_scouts = [a[0] for a in poi.success_completion_log]
-                    unique_scouts = set(all_scouts)
-                    if len(unique_scouts) > self.parameters.coupling:  # Only if it's observed by exactly the numbers needed
+                    all_agents = [a for a in poi.observation_log]
+                    unique_agents = set(all_agents)
+                    if len(unique_agents) > self.parameters.coupling:  # Only if it's observed by exactly the numbers needed
                         no_reward = True;
 
-
-                    # Scouts rewards
+                    # Disburse rewards
                     if not no_reward:
-                        for agent_id in unique_scouts:
+                        for agent_id in unique_agents:
                             rewards[agent_id] += 1.0 / self.parameters.num_poi  # Reward the first group of agents to get there
 
         else: #G reward
-            rewards = np.zeros(self.parameters.num_agents_scout + self.parameters.num_agents_service_bot)
+            rewards = np.zeros(self.parameters.num_agents)
             rewards += global_reward  # Global reward scheme
         return rewards, global_reward
 
@@ -1436,10 +1310,10 @@ class statistics(): #Tracker
     def __init__(self, parameters):
         self.fitnesses = []; self.avg_fitness = 0; self.tr_avg_fit = []
         self.avg_mpc = 0; self.tr_avg_mpc = []; self.mpc_std = []; self.tr_mpc_std = []
-        if parameters.D_reward:
-            self.file_save = 'Difference_Eval.csv'
+        if parameters.is_memoried:
+            self.file_save = 'Memory_net.csv'
         else:
-            self.file_save = 'Global_Eval.csv'
+            self.file_save = 'Normal_net.csv'
 
 
 
@@ -1463,7 +1337,7 @@ class statistics(): #Tracker
         self.tr_avg_fit.append(np.array([generation, self.avg_fitness]))
         np.savetxt(self.file_save, np.array(self.tr_avg_fit), fmt='%.3f', delimiter=',')
 
-class Population(): #Keras population
+class keras_Population(): #Keras population
     def __init__(self, input_size, hidden_nodes, output, population_size, elite_fraction = 0.2):
         self.population_size = population_size
         self.elite_fraction = int(elite_fraction * population_size)
@@ -1516,228 +1390,6 @@ class Population(): #Keras population
                 # if (randint(1, 100) == 5):  # SUPER MUTATE
                 #     w[i][j][k] += np.random.normal(-1 * much_strength, 1 * much_strength)
         model_out.set_weights(w)  # Save weights
-
-def init_nn(input_size, hidden_nodes, middle_layer = False, weights = 0):
-    model = Sequential()
-
-
-    if middle_layer:
-        model.add(Dense(hidden_nodes, input_dim=input_size, weights=weights, W_regularizer=l2(0.01), activity_regularizer=activity_l2(0.01)))
-    else:
-        model.add(Dense(hidden_nodes, input_dim=input_size, init='he_uniform', W_regularizer=l2(0.01), activity_regularizer=activity_l2(0.01)))
-    #model.add(LeakyReLU(alpha=.2))
-    #model.add(SReLU(t_left_init='zero', a_left_init='glorot_uniform', t_right_init='glorot_uniform', a_right_init='one'))
-    model.add(Activation('sigmoid'))
-    #model.add(Dropout(0.1))
-    #model.add(Activation('sigmoid'))
-    sgd = SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True)
-    if not middle_layer:
-        model.add(Dense(input_size, init= 'he_uniform')) #Output of the prediction module
-    model.compile(loss='mse', optimizer=sgd)
-
-    # if pretrain: #Autoencoder pretraining
-    #     model.fit(train_x, train_x, nb_epoch=50, batch_size=32, shuffle=True, validation_data=(valid_x, valid_x),
-    #                     verbose=1)
-    return model
-
-def dev_EvaluateGenomeList_Parallel(genome_list, evaluator, cores=4, display=True, ipython_client=None):
-    #''' If ipython_client is None, will use concurrent.futures.
-    #Pass an instance of Client() in order to use an IPython cluster '''
-    fitnesses = []
-    curtime = time.time()
-
-    #if ipython_client is None:# or not ipython_installed:
-    with ProcessPoolExecutor(max_workers=cores) as executor:
-        for i, fitness in enumerate(executor.map(evaluator, genome_list)):
-            fitnesses += [fitness]
-
-            if display:
-                #if ipython_installed: clear_output(wait=True)
-                print('Individuals: (%s/%s) Fitness: %3.4f' % (i, len(genome_list), fitness))
-    #else:
-
-        # if type(ipython_client) == Client:
-        #     lbview = ipython_client.load_balanced_view()
-        #     amr = lbview.map(evaluator, genome_list, ordered=True, block=False)
-        #     for i, fitness in enumerate(amr):
-        #         if display:
-        #             #if ipython_installed: clear_output(wait=True)
-        #             print('Individual:', i, 'Fitness:', fitness)
-        #         fitnesses.append(fitness)
-        # else:
-        #     raise ValueError('Please provide valid IPython.parallel Client() as ipython_client')
-
-    elapsed = time.time() - curtime
-
-    if display:
-        print('seconds elapsed: %3.4f' % elapsed)
-
-    return fitnesses
-
-def old_visualize_trajectory(filename = 'trajectory.csv'):
-    import Tkinter as tk
-    #from math import *
-
-    def get_triangle_points(scale=0.1):
-        point0 = [0, 0]
-        point1 = [scale * (math.cos(math.radians(120)) - 1), scale * (math.sin(math.radians(120)))]
-        point2 = [scale * (math.cos(math.radians(240)) - 1), scale * (math.sin(math.radians(240)))]
-        return [point0, point1, point2]
-
-    def get_line_points():
-        return [[0., 0.], [1., 0.]]
-
-    def get_circle_points(radius=2):
-        return [[radius, radius], [-radius, -radius]]
-
-    def scale_rotate_points(point_arr, vector):
-        transformed_point_arr = []
-
-        for point in point_arr:
-            transformed_point_arr.append([
-                point[0] * vector[0] - point[1] * vector[1],
-                point[0] * vector[1] + point[1] * vector[0]
-            ])
-
-        return transformed_point_arr
-
-    def translate_points(point_arr, vector):
-        transformed_point_arr = []
-
-        for point in point_arr:
-            transformed_point_arr.append([
-                point[0] + vector[0],
-                point[1] + vector[1]
-            ])
-
-        return transformed_point_arr
-
-    def transform_points(point_arr, transform):
-        transformed_point_arr = []
-
-        for point in point_arr:
-            transformed_point_arr.append([
-                point[0] * transform[0][0] + point[1] * transform[0][1] + transform[0][2],
-                point[0] * transform[1][0] + point[1] * transform[1][1] + transform[1][2],
-            ])
-
-        return transformed_point_arr
-
-    class Path:
-
-        def __init__(self, position_arr=[], color="black"):
-            self.position_arr = position_arr
-            self.color = color
-
-        def get_position(self, index):
-            return self.position_arr[index]
-
-    class Visualizer:
-
-        def __init__(self):
-            self.path_arr = []
-            self.spot_arr = []
-            self.time_index = 0
-            self.transform = [[0, 20, 0],
-                              [20, 0, 0],
-                              [0, 0, 1]]  # stored in rows
-            self.root = None
-            self.canvas = None
-            self.max_time_index = 0
-
-        def create_path(self, position_arr, color="black"):
-            self.path_arr.append(Path(position_arr, color))
-            self.max_time_index = len(position_arr) - 1
-
-        def create_spot(self, spot):
-            self.spot_arr.append(spot)
-
-        def run(self, width=200, height=200, time=0):
-
-            self.root = tk.Tk()
-            self.root.bind("<Return>", self.increment_time)
-            self.root.bind("<BackSpace>", self.decrement_time)
-
-            self.canvas = tk.Canvas(self.root, width=width, height=height)
-            self.canvas.pack()
-
-            self.update_canvas()
-
-            self.root.mainloop()
-
-        def draw_path_step(self, path, time_index):
-            step_start = path.get_position(time_index - 1)
-            step_stop = path.get_position(time_index)
-            step_change = [
-                step_stop[0] - step_start[0],
-                step_stop[1] - step_start[1]
-            ]
-
-            arrow_line = get_line_points()
-            arrow_line = scale_rotate_points(arrow_line, step_change)
-            arrow_line = translate_points(arrow_line, step_start)
-            arrow_line = transform_points(arrow_line, self.transform)
-            self.canvas.create_line(arrow_line, fill=path.color)
-
-            if self.time_index == time_index:
-                arrow_tip = get_triangle_points()
-                arrow_tip = scale_rotate_points(arrow_tip, step_change)
-                arrow_tip = translate_points(arrow_tip, step_stop)
-                arrow_tip = transform_points(arrow_tip, self.transform)
-                self.canvas.create_polygon(arrow_tip, fill=path.color)
-
-        def draw_spot(self, spot):
-            circle = get_circle_points(radius=0.5)
-            circle = translate_points(circle, spot)
-            circle = transform_points(circle, self.transform)
-            self.canvas.create_oval(circle, fill="black")
-
-        def update_canvas(self):
-            self.canvas.delete(tk.ALL)
-
-            for spot in self.spot_arr:
-                self.draw_spot(spot)
-
-            for time in range(self.time_index):
-                for path in self.path_arr:
-                    self.draw_path_step(path, time + 1)
-
-            self.root.update_idletasks()
-
-        def increment_time(self, event):
-            if self.time_index < self.max_time_index:
-                self.time_index += 1
-                self.update_canvas()
-
-        def decrement_time(self, event):
-            if self.time_index > 0:
-                self.time_index -= 1
-                self.update_canvas()
-
-    def csv_trajectory_parser(filename):
-        #Trajectory CSV Parser
-        trajectory = np.loadtxt(filename, delimiter=',')
-        path = []
-        for i in range(len(trajectory[0])/2): #For each agent (two rows)
-            element_path = []
-            for time in range(len(trajectory)):
-                element_path.append([trajectory[time][2*i], trajectory[time][2*i+1]])
-            path.append(element_path)
-        return path
-
-    v = Visualizer()
-    all_paths = csv_trajectory_parser(filename)
-    print len(all_paths)
-    for path in all_paths:
-        print path
-        v.create_path(path)
-
-
-    #v.create_path([[1., 10.], [30., 30.], [21., 45.]], 'blue')
-    #v.create_path([[10., 10.], [10., 30.], [40., 40.]], 'red')
-
-    v.create_spot([1.0, 1.0])
-    v.run()
 
 def vizualize_trajectory(filename = 'trajectory.csv'):
     print
@@ -1929,266 +1581,6 @@ def vizualize_trajectory(filename = 'trajectory.csv'):
     # v.create_path([[10.,10.],[10.,30.],[40.,40.]],'red','circle')
     v.run()
 
-
-def new_vizualize_trajectory(filename='trajectory.csv'):
-    import Tkinter as tk
-    # from visualizer_math import *
-    import csv
-
-    class Path:
-
-        def __init__(
-                self, position_arr=[],
-                color="black",
-                style="solid"  # or "dashed" #or "circle"
-        ):
-            self.position_arr = position_arr
-            self.color = color
-            self.style = style
-
-        def get_path_slice(self, start=0, end=1):  # inclusive
-            return self.position_arr[start:end + 1]
-
-        def get_path_position(self, time):
-            return self.position_arr[time]
-
-    class Visualizer:
-
-        def __init__(self):
-            self.path_arr = []
-            self.time_index = 0
-
-            self.root = None
-            self.canvas = None
-            self.legend = None
-            self.time_label = None
-            self.legend_item_arr = []
-            self.max_time_index = 0
-
-            # options (all applied after drawing transform)
-            self.circle_radius = 10
-            self.line_width = 2
-            self.line_dash = (5, 5)
-            self.arrow_shape = (8, 10, 3)
-            self.transform = [[0, 20, 0],
-                              [20, 0, 0],
-                              [0, 0, 1]]  # stored in rows
-            self.max_x = 200  # auto adjust as paths are entered
-            self.max_y = 200  # auto adjust as paths are entered
-            self.make_grid = True
-            self.grid_x_spacing = 20
-            self.grid_y_spacing = 20
-            self.grid_color = "white"
-            self.grid_dash = ()  # use () for no dash
-
-        def transform_points(self, point_arr, transform):
-            transformed_point_arr = []
-
-            for point in point_arr:
-                transformed_point_arr.append([
-                    point[0] * transform[0][0] + point[1] * transform[0][1] + transform[0][2],
-                    point[0] * transform[1][0] + point[1] * transform[1][1] + transform[1][2],
-                ])
-            return transformed_point_arr
-
-        def create_legend_item(self, name, color, style):
-            self.legend_item_arr.append([name, color, style])
-
-        def create_path(self, position_arr, color="black", style="solid"):
-            position_arr = self.transform_points(position_arr, self.transform)
-            for point in position_arr:
-                self.max_x = max(point[0] + self.grid_x_spacing, self.max_x)
-                self.max_y = max(point[1] + self.grid_y_spacing, self.max_y)
-            self.path_arr.append(Path(position_arr, color, style))
-            self.max_time_index = len(position_arr) - 1
-
-        def run(self):
-            self.root = tk.Tk()
-            self.root.bind("<Return>", self.increment_time)
-            self.root.bind("<BackSpace>", self.decrement_time)
-
-            self.canvas = tk.Canvas(self.root, width=self.max_x, height=self.max_y)
-            self.canvas.pack()
-            self.update_canvas()
-
-            self.legend = tk.Toplevel(width=600, height=200)
-            self.legend.title("Legend")
-
-            self.time_label = tk.StringVar()
-            tk.Label(self.legend, text="Time:-").grid(row=0)
-            tk.Label(
-                self.legend,
-                textvariable=self.time_label
-            ).grid(row=0, column=1)
-            self.update_legend()
-
-            for legend_item_index in range(len(self.legend_item_arr)):
-                tk.Label(
-                    self.legend,
-                    text=self.legend_item_arr[legend_item_index][0]
-                ).grid(row=legend_item_index + 1)
-                self.create_legend_canvas(
-                    self.legend_item_arr[legend_item_index][1],
-                    self.legend_item_arr[legend_item_index][2],
-                    legend_item_index + 1
-                )
-
-            self.root.mainloop()
-
-        def create_legend_canvas(self, color, style, index):
-            canvas = tk.Canvas(
-                self.legend,
-                width=10 * self.circle_radius,
-                height=self.circle_radius
-            )
-            canvas.create_oval(
-                0,
-                0,
-                self.circle_radius,
-                self.circle_radius,
-                fill=color,
-                outline=color
-            )
-            if style == "solid":
-                canvas.create_line(
-                    self.circle_radius,
-                    self.circle_radius // 2,
-                    5 * self.circle_radius,
-                    self.circle_radius // 2,
-                    fill=color,
-                    width=self.line_width,
-                )
-            elif style == "dashed":
-                canvas.create_line(
-                    self.circle_radius,
-                    self.circle_radius // 2,
-                    5 * self.circle_radius,
-                    self.circle_radius // 2,
-                    fill=color,
-                    dash=self.line_dash,
-                    width=self.line_width,
-                )
-            canvas.grid(row=index, column=1)
-
-        def draw_path(self, path, start=0, end=1):  # inclusive
-            if path.style == "circle":
-                path_position = path.get_path_position(end)
-                self.canvas.create_oval(
-                    path_position[0] - self.circle_radius,
-                    path_position[1] - self.circle_radius,
-                    path_position[0] + self.circle_radius,
-                    path_position[1] + self.circle_radius,
-                    fill=path.color,
-                    outline=path.color
-                )
-            elif end != 0:
-                path_slice = path.get_path_slice(start, end)
-
-                if path.style == "solid":
-                    self.canvas.create_line(
-                        path_slice,
-                        fill=path.color,
-                        width=self.line_width,
-                        arrowshape=self.arrow_shape,
-                        arrow=tk.LAST
-                    )
-                elif path.style == "dashed":
-                    self.canvas.create_line(
-                        path_slice,
-                        fill=path.color,
-                        dash=self.line_dash,
-                        width=self.line_width,
-                        arrowshape=self.arrow_shape,
-                        arrow=tk.LAST
-                    )
-
-        def update_canvas(self):
-            # drawing order matters
-            self.canvas.delete(tk.ALL)
-
-            if self.make_grid:
-                self.draw_grid()
-
-            for path in self.path_arr:
-                self.draw_path(path, start=0, end=self.time_index)
-
-            self.root.update_idletasks()
-
-        def draw_grid(self):
-            num_horizontal = int(self.max_y / self.grid_y_spacing)
-            num_vertical = int(self.max_x / self.grid_x_spacing)
-
-            for horizontal_index in range(num_horizontal):
-                self.canvas.create_line(
-                    0,
-                    horizontal_index * self.grid_y_spacing,
-                    self.max_x,
-                    horizontal_index * self.grid_y_spacing,
-                    fill=self.grid_color,
-                    dash=self.grid_dash
-                )
-
-            for vertical_index in range(num_vertical):
-                self.canvas.create_line(
-                    vertical_index * self.grid_x_spacing,
-                    0,
-                    vertical_index * self.grid_x_spacing,
-                    self.max_y,
-                    fill=self.grid_color,
-                    dash=self.grid_dash
-                )
-
-        def update_legend(self):
-            self.time_label.set(str(self.time_index))
-
-        def increment_time(self, event):
-            if self.time_index < self.max_time_index:
-                self.time_index += 1
-                self.update_canvas()
-                self.update_legend()
-
-        def decrement_time(self, event):
-            if self.time_index > 0:
-                self.time_index -= 1
-                self.update_canvas()
-                self.update_legend()
-
-    v = Visualizer()
-
-    # import pandas as pd
-    datafile = filename
-    data = list(csv.reader(open(datafile)))
-
-    macros = data[0]  # Comments about number of scouts, service bots and POIs
-    macros = [float(a) for a in macros]
-    print 'Scouts: ', macros[0]
-    print 'Service-bots: ', macros[1]
-    print 'POIs: ', macros[2]
-    data.pop(0)
-
-    data = np.array(data)
-    for agent_index in range(len(data[0]) / 2):
-        position_arr = []
-        for time in range(len(data)):
-            position_arr.append([
-                float(data[time][agent_index * 2]),
-                float(data[time][agent_index * 2 + 1])
-            ])
-        if agent_index < int(macros[0]):  # Scouts
-            v.create_path(position_arr, 'blue', style='dashed')
-            v.create_path(position_arr, 'blue', 'circle')
-        elif agent_index < int(macros[1]) + int(macros[0]):  # Service-bots
-            v.create_path(position_arr, 'green', 'solid')
-            v.create_path(position_arr, 'green', 'circle')
-        else:
-            v.create_path(position_arr, 'red', 'circle')
-
-    # v.create_path([[10.,10.],[30.,30.],[21.,45.]],'blue',style ='dashed')
-    # v.create_path([[10.,10.],[10.,30.],[40.,40.]],'red', 'solid')
-    # v.create_path([[10.,10.],[10.,30.],[40.,40.]],'red','circle')
-    v.create_legend_item("hi", "blue", "dashed")
-    v.run()
-
 def dispGrid(gridworld, state = None, full=True, agent_id = None):
 
 
@@ -2229,6 +1621,43 @@ def dispGrid(gridworld, state = None, full=True, agent_id = None):
         for e in row:
             print e,
         print '\t'
+
+def roulette_wheel(scores):
+    scores = scores / np.sum(scores)  # Normalize
+    rand = random.random()
+    counter = 0
+    for i in range(len(scores)):
+        counter += scores[i]
+        if rand < counter:
+            return i
+
+
+
+
+#BACKUPS
+
+def init_nn(input_size, hidden_nodes, middle_layer = False, weights = 0):
+    model = Sequential()
+
+
+    if middle_layer:
+        model.add(Dense(hidden_nodes, input_dim=input_size, weights=weights, W_regularizer=l2(0.01), activity_regularizer=activity_l2(0.01)))
+    else:
+        model.add(Dense(hidden_nodes, input_dim=input_size, init='he_uniform', W_regularizer=l2(0.01), activity_regularizer=activity_l2(0.01)))
+    #model.add(LeakyReLU(alpha=.2))
+    #model.add(SReLU(t_left_init='zero', a_left_init='glorot_uniform', t_right_init='glorot_uniform', a_right_init='one'))
+    model.add(Activation('sigmoid'))
+    #model.add(Dropout(0.1))
+    #model.add(Activation('sigmoid'))
+    sgd = SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True)
+    if not middle_layer:
+        model.add(Dense(input_size, init= 'he_uniform')) #Output of the prediction module
+    model.compile(loss='mse', optimizer=sgd)
+
+    # if pretrain: #Autoencoder pretraining
+    #     model.fit(train_x, train_x, nb_epoch=50, batch_size=32, shuffle=True, validation_data=(valid_x, valid_x),
+    #                     verbose=1)
+    return model
 
 def init_rnn(gridworld, hidden_nodes, angled_repr, angle_res, sim_all, hist_len = 3, design = 1):
     model = Sequential()
@@ -2301,78 +1730,6 @@ def save_qmodel(q_model, foldername = '/Models/'):
     #Save weights
     for i in range(len(q_model)):
         q_model[i].save_weights('Models/model_weights_' + str(i) + '.h5', overwrite=True)
-
-def roulette_wheel(scores):
-    scores = scores / np.sum(scores)  # Normalize
-    rand = random.random()
-    counter = 0
-    for i in range(len(scores)):
-        counter += scores[i]
-        if rand < counter:
-            return i
-
-
-
-
-
-
-
-
-
-#BACKUPS
-def bck_move_and_get_reward(self, agent_id, action):
-    next_pos = np.copy(self.agent_pos[agent_id])
-    if action == 1:
-        next_pos[1] += 1  # Right
-    elif action == 2:
-        next_pos[0] += 1  # Down
-    elif action == 3:
-        next_pos[1] -= 1  # Left
-    elif action == 4:
-        next_pos[0] -= 1  # Up
-
-    # Computer reward and check illegal moves
-    reward = 0  # If nothing else
-    x = next_pos[0]
-    y = next_pos[1]
-    if self.state[x][y] == 3:  # Wall
-        next_pos[0] = self.agent_pos[agent_id][0];
-        next_pos[1] = self.agent_pos[agent_id][1]
-        # reward = -0.0001
-    if self.state[x][y] == 1 and action != 0:  # Other Agent
-        # reward = -0.05
-        next_pos[0] = self.agent_pos[agent_id][0];
-        next_pos[1] = self.agent_pos[agent_id][1]
-        # if self.state[x][y] == 0 or (self.state[x][y] == 1 and action == 0):  # Free Space
-        # reward = -0.0001
-    if self.state[x][y] == 2 and action != 0:  # POI
-        next_pos[0] = self.agent_pos[agent_id][0];
-        next_pos[1] = self.agent_pos[agent_id][1]
-
-    # Update gridworld and agent position
-    if self.state[self.agent_pos[agent_id][0]][self.agent_pos[agent_id][1]] != 2:
-        self.state[self.agent_pos[agent_id][0]][self.agent_pos[agent_id][1]] = 0
-    if self.state[next_pos[0]][next_pos[1]] != 2:
-        self.state[next_pos[0]][next_pos[1]] = 1
-    self.agent_pos[agent_id][0] = next_pos[0]
-    self.agent_pos[agent_id][1] = next_pos[1]
-
-    # Check for credit assignment
-    for poi_id in range(self.num_poi):  # POI COUPLED
-        if self.goal_complete[poi_id] == False:
-            try:
-                self.poi_soft_status[poi_id].remove(agent_id)
-            except:
-                1 + 1
-            if abs(self.poi_pos[poi_id][0] - self.agent_pos[agent_id][0]) <= self.obs_dist and abs(
-                            self.poi_pos[poi_id][1] - self.agent_pos[agent_id][1]) <= self.obs_dist:
-                self.poi_soft_status[poi_id].append(agent_id)
-                reward += 1.0 - 1.0 / (len(self.poi_soft_status[poi_id]) + 1)
-            if len(self.poi_soft_status[poi_id]) >= self.coupling:
-                self.goal_complete[poi_id] = True
-                reward = 1
-
-    return reward
 
 def test_nets():
     from fann2 import libfann
