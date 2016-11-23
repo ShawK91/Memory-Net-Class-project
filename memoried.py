@@ -7,7 +7,7 @@ from random import randint#, choice
 class Deap_param:
     def __init__(self, angle_res, is_memoried):
         self.num_input = (360 * 2 / angle_res)
-        self.num_hnodes = 10
+        self.num_hnodes = 15
         self.num_output = 5
 
         self.elite_fraction = 0.05
@@ -18,7 +18,17 @@ class Deap_param:
                 self.num_hnodes * (self.num_input + 1) + self.num_hnodes * (self.num_output + 1)) + 2 * self.num_hnodes * (
                 self.num_hnodes + 1) + self.num_output * (self.num_hnodes + 1) + self.num_hnodes
         else:
-            self.total_num_weights = self.num_hnodes*(self.num_input + 1) + self.num_output * (self.num_hnodes + 1)
+            # Normalize network flexibility by changing hidden nodes
+            naive_total_num_weights = self.num_hnodes*(self.num_input + 1) + self.num_output * (self.num_hnodes + 1)
+            mem_weights = 3 * (
+                self.num_hnodes * (self.num_input + 1) + self.num_hnodes * (self.num_output + 1)) + 2 * self.num_hnodes * (
+                self.num_hnodes + 1) + self.num_output * (self.num_hnodes + 1) + self.num_hnodes
+            normalization_factor = int(mem_weights/naive_total_num_weights)
+
+            #Set parameters for comparable flexibility with memoried net
+            self.num_hnodes *= normalization_factor + 1
+            self.total_num_weights = self.num_hnodes * (self.num_input + 1) + self.num_output * (self.num_hnodes + 1)
+        print 'Num parameters: ', self.total_num_weights
 
 class Parameters:
     def __init__(self):
@@ -36,7 +46,7 @@ class Parameters:
             self.total_generations = 1000
 
             #DEAP stuff
-            self.is_memoried = 0
+            self.is_memoried = 1
             self.use_deap = 1
             if self.use_deap: self.deap_param = Deap_param(self.angle_res, self.is_memoried)
 
