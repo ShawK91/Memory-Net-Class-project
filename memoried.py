@@ -7,7 +7,7 @@ from random import randint#, choice
 class Deap_param:
     def __init__(self, angle_res, is_memoried):
         self.num_input = (360 * 2 / angle_res)
-        self.num_hnodes = 15
+        self.num_hnodes = 5
         self.num_output = 5
 
         self.elite_fraction = 0.05
@@ -34,11 +34,11 @@ class Parameters:
     def __init__(self):
             self.population_size = 100
             self.D_reward = 1  # D reward scheme
-            self.grid_row = 20
-            self.grid_col = 20
-            self.total_steps = 20 # Total roaming steps without goal before termination
-            self.num_agents = 3
-            self.num_poi = 20
+            self.grid_row = 10
+            self.grid_col = 10
+            self.total_steps = 3 # Total roaming steps without goal before termination
+            self.num_agents = 2
+            self.num_poi = 5
             self.agent_random = 0
             self.poi_random = 1
             self.wheel_action = 0
@@ -46,7 +46,7 @@ class Parameters:
             self.total_generations = 1000
 
             #DEAP stuff
-            self.is_memoried = 1
+            self.is_memoried = 0
             self.use_deap = 1
             if self.use_deap: self.deap_param = Deap_param(self.angle_res, self.is_memoried)
 

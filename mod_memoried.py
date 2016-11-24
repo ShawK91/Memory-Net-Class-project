@@ -592,8 +592,8 @@ class Evo_net():
 
     def epoch(self): #Method to complete epoch after fitness has been assigned to the genomes
         if self.parameters.use_deap:
-            for i, individual in enumerate(self.pop):
-                individual.fitness.values = self.fitness_evals[i]  # Assign fitness
+            # for i, individual in enumerate(self.pop):
+            #     individual.fitness.values = self.fitness_evals[i]  # Assign fitness
 
             # Elitist reserve
             elitist_reserve = []
@@ -890,7 +890,6 @@ class Agent:
         #action = np.argmax(scores)
 
         self.action = action
-
 
     def take_action(self):
         #Modify state input to required input format
