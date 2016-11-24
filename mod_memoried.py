@@ -921,6 +921,19 @@ class POI:
         self.observation_log = []
         self.is_observed = False
 
+        #Periodicity
+        self.visible = True
+        self.period = parameters.period
+
+
+
+    def do_periodic(self, step):
+        ig = step + self.team_role_index
+        ig = int(ig / self.period)
+        ig = ig % 2
+        self.visible = ig
+
+
     def take_action(self):
         if self.parameters.periodic_poi:
             action_choice = self.previous_actions[0]
@@ -1130,7 +1143,7 @@ class Gridworld:
 
 
             for poi in self.poi_list:
-                if not poi.is_observed:  # For all POI's that are still active
+                if poi.visible:  # For all POI's that are still active
                     x1 = poi.position[0] - agent.position[0];
                     x2 = -1
                     y1 = poi.position[1] - agent.position[1];
@@ -1207,15 +1220,20 @@ class Gridworld:
     def update_poi_observations(self):
         # Check for credit assignment
         for poi in self.poi_list:  # POI COUPLED
+            test_gate = True
+            if self.parameters.test_observation and not poi.visible: test_gate = False
 
-            #Agents
-            soft_stat = []
-            for agent_id, agent in enumerate(self.agent_list): #Find all scouts within range
-                if abs(poi.position[0] - agent.position[0]) <= self.obs_dist*2 and abs(poi.position[1] - agent.position[1]) <= self.obs_dist*2:  # and self.goal_complete[poi_id] == False:
-                    soft_stat.append(agent_id)
-            if len(soft_stat) >= self.coupling:  # If coupling requirement is met
-                for ag_id in soft_stat: poi.observation_log.append(ag_id)
-                poi.is_observed = True
+
+
+            if test_gate:
+                #Agents
+                soft_stat = []
+                for agent_id, agent in enumerate(self.agent_list): #Find all scouts within range
+                    if abs(poi.position[0] - agent.position[0]) <= self.obs_dist*2 and abs(poi.position[1] - agent.position[1]) <= self.obs_dist*2:  # and self.goal_complete[poi_id] == False:
+                        soft_stat.append(agent_id)
+                if len(soft_stat) >= self.coupling:  # If coupling requirement is met
+                    for ag_id in soft_stat: poi.observation_log.append(ag_id)
+                    poi.is_observed = True
 
 
     def save_pop(self):
@@ -1314,9 +1332,6 @@ class statistics(): #Tracker
             self.file_save = 'Memory_net.csv'
         else:
             self.file_save = 'Normal_net.csv'
-
-
-
 
     def add_fitness(self, fitness, generation):
         self.fitnesses.append(fitness)

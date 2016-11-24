@@ -36,9 +36,9 @@ class Parameters:
             self.D_reward = 1  # D reward scheme
             self.grid_row = 20
             self.grid_col = 20
-            self.total_steps = 25 # Total roaming steps without goal before termination
-            self.num_agents = 5
-            self.num_poi = 10
+            self.total_steps = 20 # Total roaming steps without goal before termination
+            self.num_agents = 3
+            self.num_poi = 20
             self.agent_random = 0
             self.poi_random = 1
             self.wheel_action = 0
@@ -49,6 +49,10 @@ class Parameters:
             self.is_memoried = 1
             self.use_deap = 1
             if self.use_deap: self.deap_param = Deap_param(self.angle_res, self.is_memoried)
+
+            #POI periodicity
+            self.period = 3
+            self.test_observation = True
 
 
 
@@ -262,9 +266,11 @@ def run_simulation(parameters, gridworld, genome_ind, is_test = False): #Run sim
 
     #if is_test: trajectory_log = []
     gridworld.reset(genome_ind)  # Reset board and build net
-    mod.dispGrid(gridworld)
+    #mod.dispGrid(gridworld)
 
     for steps in range(parameters.total_steps):  # One training episode till goal is not reached
+        for poi in gridworld.poi_list: poi.do_periodic(steps) #Implement periodicity
+
         if is_test: ig_traj_log = []
 
         for id, agent in enumerate(gridworld.agent_list):  #get all the action choices from the agents
@@ -306,15 +312,7 @@ def run_simulation(parameters, gridworld, genome_ind, is_test = False): #Run sim
             ig_traj_log.append(poi.position[1])
         trajectory_log.append(np.array(ig_traj_log))
 
-
-
-
-
-
     rewards, global_reward = gridworld.get_reward()
-    #print rewards, global_reward
-    #print rewards
-    #rewards -= 0.001 * steps #Time penalty
 
     if is_test:
         #trajectory_log = np.array(trajectory_log)
